@@ -10,12 +10,108 @@ jobs:
       run:
         shell: bash -l -e -o pipefail {0}
 
+    env:
+      SINGULARITY_VERSION: "4.2.2"
+
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        irods: [
+          { version: "4.2.7",
+            client_image: "ghcr.io/wtsi-npg/ub-16.04-irods-clients-4.2.7:latest",
+            server_image: "ghcr.io/wtsi-npg/ub-16.04-irods-4.2.7:latest",
+            experimental: false },
+          { version: "4.3.4",
+            client_image: "ghcr.io/wtsi-npg/ub-22.04-irods-clients-4.3.4:latest",
+            server_image: "ghcr.io/wtsi-npg/ub-22.04-irods-4.3.4:latest",
+            experimental: false },
+          { version: "4.3.5",
+            client_image: "ghcr.io/wtsi-npg/ub-22.04-irods-clients-4.3.5:latest",
+            server_image: "ghcr.io/wtsi-npg/ub-22.04-irods-4.3.5:latest",
+            experimental: false }
+        ]
+
+    services:
+      irods-server:
+        image: ${{ matrix.irods.server_image }}
+        ports:
+          - "1247:1247"
+          - "20000-20199:20000-20199"
+        volumes:
+          - /dev/shm:/dev/shm
+        options: >-
+          --health-cmd "nc -z -v localhost 1247"
+          --health-start-period 60s
+          --health-interval 10s
+          --health-timeout 20s
+          --health-retries 6
 
     steps:
+      - name: "Set environmental variables based on other environmental variables"
+        run: |
+          echo "SINGULARITY_CACHEDIR=$HOME/.singularity-cache" >> $GITHUB_ENV
+          # '~' in SINGULARITY_CACHEDIR value (from say a env: section in this YAML) is not expanded by
+          # singularity so that paths used are misleading/unclear
+
       - uses: actions/checkout@v7
+
+      - name: "Install Singularity"
+        run: |
+          pkg="singularity-ce_${SINGULARITY_VERSION}-$(lsb_release -sc)_amd64.deb"
+          curl -sSL -O "https://github.com/sylabs/singularity/releases/download/v${SINGULARITY_VERSION}/$pkg"
+          curl -sSL -O "https://github.com/sylabs/singularity/releases/download/v${SINGULARITY_VERSION}/sha256sums"
+          grep "$os_release" sha256sums | sha256sum
+          sudo apt-get install -q -y "./$pkg"
+
+          # Avoid the runner's loop devices being exhausted
+          sudo singularity config global --set "max loop devices" 128
+
+          # Enable DBus for this user, so that rootless cgroups works and we can create
+          # Singularity service instances. See https://github.com/containers/podman/issues/5443
+          systemctl --user enable --now dbus.socket
+          echo DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" >> $GITHUB_ENV
+
+      - name: "Cache Singularity images"
+        uses: actions/cache@v6
+        env:
+          SINGULARITY_CACHEDIR: ${{ github.workspace }}/.singularity-cache
+        with:
+          path: ${{ env.SINGULARITY_CACHEDIR }}
+          key: ${{ runner.os }}-singularity
+
+      - name: "Install iRODS client wrappers"
+        env:
+          DOCKER_IMAGE: ${{ matrix.irods.client_image }}
+        run: |
+          # Use -s option for the wrappers to enable re-usable service instances
+          # Install is to HOME rather than workspace to avoid clashes with repo e.g. in bin/
+          singularity exec docker://$DOCKER_IMAGE singularity-wrapper -s -p "$HOME/.local" install
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: "Configure iRODS clients"
+        env:
+          DOCKER_IMAGE: ${{ matrix.irods.client_image }}
+          PREFIX: ${{ github.workspace }}
+        run: |
+          mkdir -p "$HOME/.irods"
+          cat <<'EOF' > "$HOME/.irods/irods_environment.json"
+          {
+              "irods_host": "localhost",
+              "irods_port": 1247,
+              "irods_user_name": "irods",
+              "irods_zone_name": "testZone",
+              "irods_home": "/testZone/home/irods",
+              "irods_default_resource": "replResc",
+              "irods_default_hash_scheme": "MD5"
+          }
+          EOF
+          
+          echo "irods" | script -q -c "iinit" /dev/null
+          ienv
+          ils
+          ilsresc
+          
+          baton-do --version
 
       - name: "Set up Python ${{ matrix.python-version }}"
         uses: actions/setup-python@v7
@@ -39,6 +135,8 @@ jobs:
           basedpyright --pythonversion "$PYTHON_VERSION"
 
       - name: "Run tests"
+        env:
+          IRODS_VERSION: ${{ matrix.irods.version }}
         run: |
           pip install .
           pytest --it
